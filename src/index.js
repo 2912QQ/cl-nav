@@ -10,15 +10,64 @@ const stmt = (c, sql, p = []) => c.env.DB.prepare(sql).bind(...p.map(n));
 const all = async (c, sql, ...p) => (await stmt(c, sql, p).all()).results;
 const first = (c, sql, ...p) => stmt(c, sql, p).first();
 const run = (c, sql, ...p) => stmt(c, sql, p).run();
-const MAX_IMG = 1024 * 1024; // D1 单行上限约 2MB，base64 后约 1.33 倍，这里限制 1MB
-function bigB64(buf) {
-  const u = new Uint8Array(buf); let s = '';
-  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
-  return btoa(s);
-}
+const MAX_IMG = 10 * 1024 * 1024; // KV 单值上限 25MB
 const exp2h = () => Math.floor(Date.now() / 1000) + 7200;
 
 app.onError((e, c) => c.json({ error: e.message }, 500));
+
+// ---------- 首次访问自动建表（无需手动执行 SQL） ----------
+const SCHEMA = [
+  'CREATE TABLE IF NOT EXISTS menus (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, "order" INTEGER DEFAULT 0, password_hash TEXT)',
+  'CREATE TABLE IF NOT EXISTS sub_menus (id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER NOT NULL, name TEXT NOT NULL, "order" INTEGER DEFAULT 0, password_hash TEXT, FOREIGN KEY(parent_id) REFERENCES menus(id) ON DELETE CASCADE)',
+  'CREATE TABLE IF NOT EXISTS cards (id INTEGER PRIMARY KEY AUTOINCREMENT, menu_id INTEGER, sub_menu_id INTEGER, title TEXT NOT NULL, url TEXT NOT NULL, logo_url TEXT, custom_logo_path TEXT, "desc" TEXT, "order" INTEGER DEFAULT 0, FOREIGN KEY(menu_id) REFERENCES menus(id) ON DELETE CASCADE, FOREIGN KEY(sub_menu_id) REFERENCES sub_menus(id) ON DELETE CASCADE)',
+  'CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, last_login_time TEXT, last_login_ip TEXT)',
+  'CREATE TABLE IF NOT EXISTS ads (id INTEGER PRIMARY KEY AUTOINCREMENT, position TEXT NOT NULL, img TEXT NOT NULL, url TEXT NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS friends (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, url TEXT NOT NULL, logo TEXT)',
+  'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)',
+  'CREATE INDEX IF NOT EXISTS idx_menus_order ON menus("order")',
+  'CREATE INDEX IF NOT EXISTS idx_sub_menus_parent_id ON sub_menus(parent_id)',
+  'CREATE INDEX IF NOT EXISTS idx_cards_menu_id ON cards(menu_id)',
+  'CREATE INDEX IF NOT EXISTS idx_cards_sub_menu_id ON cards(sub_menu_id)'
+];
+let ready = null;
+function ensure(env) {
+  if (!ready) {
+    ready = (async () => {
+      await env.DB.batch(SCHEMA.map(s => env.DB.prepare(s)));
+      if (!(await env.DB.prepare("SELECT 1 AS x FROM settings WHERE key='seeded'").first())) {
+        if (!(await env.DB.prepare('SELECT COUNT(*) AS n FROM menus').first()).n)
+          await env.DB.prepare('INSERT INTO menus (name,"order") VALUES (?,?)').bind('Home', 1).run();
+        await env.DB.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES ('seeded','1')").run();
+      }
+    })().catch(e => { ready = null; throw e; });
+  }
+  return ready;
+}
+app.use('/api/*', async (c, next) => { await ensure(c.env); await next(); });
+
+// JWT 密钥：优先用环境变量 JWT_SECRET；没设置则自动生成并保存在数据库里
+let genSecret = null;
+async function jwtSecret(c) {
+  if (c.env.JWT_SECRET) return c.env.JWT_SECRET;
+  if (genSecret) return genSecret;
+  const read = () => first(c, "SELECT value FROM settings WHERE key='jwt_secret'");
+  let r = await read();
+  if (!r) {
+    await run(c, "INSERT OR IGNORE INTO settings (key,value) VALUES ('jwt_secret',?)", b64(crypto.getRandomValues(new Uint8Array(32))));
+    r = await read();
+  }
+  return (genSecret = r.value);
+}
+const safeEq = (a, b) => { if (a.length !== b.length) return false; let r = 0; for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i); return r === 0; };
+
+// 自检：访问 /api/health 可查看配置是否就绪（不泄露任何密钥）
+app.get('/api/health', async c => c.json({
+  ok: true,
+  kvBound: !!c.env.KV,
+  adminPasswordSet: !!c.env.ADMIN_PASSWORD,
+  jwtSecretSet: !!c.env.JWT_SECRET,
+  users: (await first(c, 'SELECT COUNT(*) AS n FROM users')).n
+}));
 
 // ---------- 密码：新格式 PBKDF2（Workers 友好），兼容旧 bcrypt ----------
 const b64 = buf => btoa(String.fromCharCode(...new Uint8Array(buf)));
@@ -45,18 +94,18 @@ const auth = async (c, next) => {
   const h = c.req.header('Authorization') || '';
   if (!h.startsWith('Bearer ')) return c.json({ error: '未授权' }, 401);
   try {
-    const p = await verify(h.slice(7), c.env.JWT_SECRET, 'HS256');
+    const p = await verify(h.slice(7), await jwtSecret(c), 'HS256');
     if (p.kind || p.typ) throw new Error('bad');
     c.set('user', p);
   } catch (e) { return c.json({ error: '无效token' }, 401); }
   await next();
 };
-const unlockSecret = c => c.env.JWT_SECRET + ':category-unlock';
-const signUnlock = (c, kind, id, ph) => sign({ typ: 'cat-unlock', kind, id: Number(id), ph, exp: exp2h() }, unlockSecret(c), 'HS256');
+const unlockSecret = async c => (await jwtSecret(c)) + ':category-unlock';
+const signUnlock = async (c, kind, id, ph) => sign({ typ: 'cat-unlock', kind, id: Number(id), ph, exp: exp2h() }, await unlockSecret(c), 'HS256');
 async function unlockTokens(c) {
   const out = [];
   for (const t of (c.req.header('x-category-unlock') || '').split(',').map(s => s.trim()).filter(Boolean)) {
-    try { const p = await verify(t, unlockSecret(c), 'HS256'); if (p.typ === 'cat-unlock') out.push(p); } catch (e) {}
+    try { const p = await verify(t, await unlockSecret(c), 'HS256'); if (p.typ === 'cat-unlock') out.push(p); } catch (e) {}
   }
   return out;
 }
@@ -75,11 +124,18 @@ async function list(c, table, order = '', map = x => x) {
 // ---------- 登录 / 用户 ----------
 app.post('/api/login', async c => {
   const { username, password } = await body(c);
+  let seeded = false;
+  if (!(await first(c, 'SELECT 1 AS x FROM users LIMIT 1'))) {
+    if (!c.env.ADMIN_PASSWORD) return c.json({ error: '服务器未设置 ADMIN_PASSWORD 环境变量' }, 500);
+    await run(c, 'INSERT INTO users (username,password) VALUES (?,?)', c.env.ADMIN_USERNAME || 'admin', await hashPassword(String(c.env.ADMIN_PASSWORD)));
+    seeded = true;
+  }
   const user = await first(c, 'SELECT * FROM users WHERE username=?', username);
-  if (!user || !(await checkPassword(password, user.password))) return c.json({ error: '用户名或密码错误' }, 401);
+  const ok = user && (seeded ? safeEq(String(password || ''), String(c.env.ADMIN_PASSWORD)) : await checkPassword(password, user.password));
+  if (!ok) return c.json({ error: '用户名或密码错误' }, 401);
   const now = new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 19).replace('T', ' ');
   await run(c, 'UPDATE users SET last_login_time=?, last_login_ip=? WHERE id=?', now, c.req.header('cf-connecting-ip') || '', user.id);
-  const token = await sign({ id: user.id, username: user.username, exp: exp2h() }, c.env.JWT_SECRET, 'HS256');
+  const token = await sign({ id: user.id, username: user.username, exp: exp2h() }, await jwtSecret(c), 'HS256');
   return c.json({ token, lastLoginTime: user.last_login_time, lastLoginIp: user.last_login_ip });
 });
 app.get('/api/users/profile', auth, async c => {
@@ -220,7 +276,7 @@ app.put('/api/friends/:id', auth, async c => {
 app.delete('/api/friends/:id', auth, async c =>
   c.json({ deleted: (await run(c, 'DELETE FROM friends WHERE id=?', c.req.param('id'))).meta.changes }));
 
-// ---------- 上传 / 图片读取（存放在 D1，无需 R2） ----------
+// ---------- 上传 / 图片读取（存放在 KV） ----------
 const IMG = /^image\/(jpeg|png|webp|gif|avif|x-icon|vnd\.microsoft\.icon)$/;
 const MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif', ico: 'image/x-icon' };
 async function saveImage(c, field, prefix, maxBytes) {
@@ -228,10 +284,10 @@ async function saveImage(c, field, prefix, maxBytes) {
   const f = form && form.get(field);
   if (!f || typeof f === 'string') return { error: '未选择文件' };
   if (!IMG.test(f.type)) return { error: '只支持 jpg/png/webp/gif/avif/ico 图片' };
-  if (f.size > maxBytes) return { error: '图片过大（限 1MB，请压缩后再传，或改用图片 URL）' };
+  if (f.size > maxBytes) return { error: '图片过大（限 10MB）' };
   const ext = ((f.name || '').match(/\.[a-z0-9]{1,5}$/i) || [''])[0].toLowerCase();
   const key = prefix + Date.now() + ext;
-  await run(c, 'INSERT OR REPLACE INTO files (name,type,data) VALUES (?,?,?)', key, f.type, bigB64(await f.arrayBuffer()));
+  await c.env.KV.put(key, await f.arrayBuffer(), { metadata: { type: f.type } });
   return { key };
 }
 app.post('/api/upload', auth, async c => {
@@ -239,10 +295,11 @@ app.post('/api/upload', auth, async c => {
   return r.error ? c.json({ error: r.error }, 400) : c.json({ filename: r.key, url: '/uploads/' + r.key });
 });
 app.get('/uploads/:name', async c => {
-  const row = await first(c, 'SELECT type, data FROM files WHERE name=?', c.req.param('name'));
-  if (!row) return c.notFound();
-  return new Response(Uint8Array.from(atob(row.data), ch => ch.charCodeAt(0)), {
-    headers: { 'Content-Type': row.type, 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' }
+  const { value, metadata } = await c.env.KV.getWithMetadata(c.req.param('name'), 'arrayBuffer');
+  if (!value) return c.notFound();
+  return new Response(value, {
+    headers: { 'Content-Type': (metadata && metadata.type) || MIME[(c.req.param('name').split('.').pop() || '').toLowerCase()] || 'application/octet-stream',
+      'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' }
   });
 });
 
@@ -252,7 +309,7 @@ async function getWp(c) {
   catch (e) { return { url: '', file: '' }; }
 }
 const setWp = (c, v) => run(c, "INSERT INTO settings (key,value) VALUES ('wallpaper',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", JSON.stringify(v));
-const dropOld = async (c, w) => { if (w.file) await run(c, 'DELETE FROM files WHERE name=?', w.file); };
+const dropOld = async (c, w) => { if (w.file) await c.env.KV.delete(w.file); };
 app.get('/api/wallpaper', async c => c.json({ url: (await getWp(c)).url || '' }));
 app.post('/api/wallpaper/url', auth, async c => {
   const url = String((await body(c)).url || '').trim();

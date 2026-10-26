@@ -1,14 +1,16 @@
 name = "cl-nav"
 main = "src/index.js"
 compatibility_date = "2025-09-01"
+keep_vars = true
 
 [assets]
 directory = "./public"
 not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/uploads/*"]
 
+# 不写 ID：首次部署时 Cloudflare 会自动创建并绑定
 [[d1_databases]]
 binding = "DB"
-database_name = "nav-db"
-database_id = "b5a7bb4d-de7a-44f6-864b-5c72da092d31"
 
+[[kv_namespaces]]
+binding = "KV"
