@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.dev.vars
+data.sql
+admin.sql
+*.tar.gz
+uploads-old/
