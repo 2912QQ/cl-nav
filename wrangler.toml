@@ -10,5 +10,5 @@ run_worker_first = ["/api/*", "/uploads/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "nav-db"
-database_id = "把 d1 create 输出的 database_id 填在这里"
+database_id = "b5a7bb4d-de7a-44f6-864b-5c72da092d31"
 
