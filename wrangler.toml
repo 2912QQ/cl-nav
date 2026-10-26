@@ -10,8 +10,5 @@ run_worker_first = ["/api/*", "/uploads/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "nav-db"
-database_id = "769a6b18-f7af-40e0-aecd-ae0cfb700402"
+database_id = "把 d1 create 输出的 database_id 填在这里"
 
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "nav-uploads"

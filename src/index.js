@@ -10,6 +10,12 @@ const stmt = (c, sql, p = []) => c.env.DB.prepare(sql).bind(...p.map(n));
 const all = async (c, sql, ...p) => (await stmt(c, sql, p).all()).results;
 const first = (c, sql, ...p) => stmt(c, sql, p).first();
 const run = (c, sql, ...p) => stmt(c, sql, p).run();
+const MAX_IMG = 1024 * 1024; // D1 单行上限约 2MB，base64 后约 1.33 倍，这里限制 1MB
+function bigB64(buf) {
+  const u = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+  return btoa(s);
+}
 const exp2h = () => Math.floor(Date.now() / 1000) + 7200;
 
 app.onError((e, c) => c.json({ error: e.message }, 500));
@@ -214,7 +220,7 @@ app.put('/api/friends/:id', auth, async c => {
 app.delete('/api/friends/:id', auth, async c =>
   c.json({ deleted: (await run(c, 'DELETE FROM friends WHERE id=?', c.req.param('id'))).meta.changes }));
 
-// ---------- 上传 / 图片读取（R2） ----------
+// ---------- 上传 / 图片读取（存放在 D1，无需 R2） ----------
 const IMG = /^image\/(jpeg|png|webp|gif|avif|x-icon|vnd\.microsoft\.icon)$/;
 const MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', avif: 'image/avif', ico: 'image/x-icon' };
 async function saveImage(c, field, prefix, maxBytes) {
@@ -222,26 +228,22 @@ async function saveImage(c, field, prefix, maxBytes) {
   const f = form && form.get(field);
   if (!f || typeof f === 'string') return { error: '未选择文件' };
   if (!IMG.test(f.type)) return { error: '只支持 jpg/png/webp/gif/avif/ico 图片' };
-  if (f.size > maxBytes) return { error: '文件过大' };
+  if (f.size > maxBytes) return { error: '图片过大（限 1MB，请压缩后再传，或改用图片 URL）' };
   const ext = ((f.name || '').match(/\.[a-z0-9]{1,5}$/i) || [''])[0].toLowerCase();
   const key = prefix + Date.now() + ext;
-  await c.env.BUCKET.put(key, await f.arrayBuffer(), { httpMetadata: { contentType: f.type } });
+  await run(c, 'INSERT OR REPLACE INTO files (name,type,data) VALUES (?,?,?)', key, f.type, bigB64(await f.arrayBuffer()));
   return { key };
 }
 app.post('/api/upload', auth, async c => {
-  const r = await saveImage(c, 'logo', '', 5 * 1024 * 1024);
+  const r = await saveImage(c, 'logo', '', MAX_IMG);
   return r.error ? c.json({ error: r.error }, 400) : c.json({ filename: r.key, url: '/uploads/' + r.key });
 });
 app.get('/uploads/:name', async c => {
-  const o = await c.env.BUCKET.get(c.req.param('name'));
-  if (!o) return c.notFound();
-  const h = new Headers();
-  o.writeHttpMetadata(h);
-  if (!h.get('content-type')) h.set('content-type', MIME[(o.key.split('.').pop() || '').toLowerCase()] || 'application/octet-stream');
-  h.set('etag', o.httpEtag);
-  h.set('Cache-Control', 'public, max-age=86400');
-  h.set('X-Content-Type-Options', 'nosniff');
-  return new Response(o.body, { headers: h });
+  const row = await first(c, 'SELECT type, data FROM files WHERE name=?', c.req.param('name'));
+  if (!row) return c.notFound();
+  return new Response(Uint8Array.from(atob(row.data), ch => ch.charCodeAt(0)), {
+    headers: { 'Content-Type': row.type, 'Cache-Control': 'public, max-age=86400', 'X-Content-Type-Options': 'nosniff' }
+  });
 });
 
 // ---------- 壁纸 ----------
@@ -250,7 +252,7 @@ async function getWp(c) {
   catch (e) { return { url: '', file: '' }; }
 }
 const setWp = (c, v) => run(c, "INSERT INTO settings (key,value) VALUES ('wallpaper',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", JSON.stringify(v));
-const dropOld = async (c, w) => { if (w.file) await c.env.BUCKET.delete(w.file); };
+const dropOld = async (c, w) => { if (w.file) await run(c, 'DELETE FROM files WHERE name=?', w.file); };
 app.get('/api/wallpaper', async c => c.json({ url: (await getWp(c)).url || '' }));
 app.post('/api/wallpaper/url', auth, async c => {
   const url = String((await body(c)).url || '').trim();
@@ -260,7 +262,7 @@ app.post('/api/wallpaper/url', auth, async c => {
   return c.json({ url });
 });
 app.post('/api/wallpaper/upload', auth, async c => {
-  const r = await saveImage(c, 'wallpaper', 'wallpaper-', 10 * 1024 * 1024);
+  const r = await saveImage(c, 'wallpaper', 'wallpaper-', MAX_IMG);
   if (r.error) return c.json({ error: r.error }, 400);
   await dropOld(c, await getWp(c));
   const url = '/uploads/' + r.key;

@@ -9,3 +9,4 @@ CREATE INDEX IF NOT EXISTS idx_menus_order ON menus("order");
 CREATE INDEX IF NOT EXISTS idx_sub_menus_parent_id ON sub_menus(parent_id);
 CREATE INDEX IF NOT EXISTS idx_cards_menu_id ON cards(menu_id);
 CREATE INDEX IF NOT EXISTS idx_cards_sub_menu_id ON cards(sub_menu_id);
+CREATE TABLE IF NOT EXISTS files (name TEXT PRIMARY KEY, type TEXT NOT NULL, data TEXT NOT NULL);
